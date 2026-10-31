@@ -1,7 +1,30 @@
-// Serveur multijoueur Astro.io (positions, tirs, dégâts, chat)
+// Serveur Astro.io : sert le jeu (index.html) et gère le multijoueur (WebSocket) sur le même port
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const { WebSocketServer } = require('ws');
+
 const PORT = process.env.PORT || 8080;
-const wss = new WebSocketServer({ port: PORT });
+
+// Serveur HTTP : renvoie le jeu à l'adresse principale
+const server = http.createServer((req, res) => {
+  if (req.url === '/' || req.url === '/index.html') {
+    fs.readFile(path.join(__dirname, 'index.html'), (err, data) => {
+      if (err) {
+        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('index.html introuvable sur le serveur');
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(data);
+    });
+  } else {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Not found');
+  }
+});
+
+// WebSocket attaché au même serveur HTTP
+const wss = new WebSocketServer({ server });
 const players = new Map(); // id -> { ws, x, y, a, name, hp, last }
 let nextId = 1;
 
@@ -21,6 +44,8 @@ wss.on('connection', ws => {
   const p = { ws, x: 7000, y: 7000, a: 0, name: 'Pilote' + id, hp: 100, last: 0 };
   players.set(id, p);
   ws.send(JSON.stringify({ type: 'welcome', id }));
+
+  ws.on('error', () => {}); // évite un crash si une connexion coupe brutalement
 
   ws.on('message', raw => {
     let msg;
@@ -71,4 +96,4 @@ setInterval(() => {
   wss.clients.forEach(c => { if (c.readyState === 1) c.send(snapshot); });
 }, 50);
 
-console.log('Serveur lancé sur le port ' + PORT);
+server.listen(PORT, () => console.log('Serveur lancé sur le port ' + PORT));
