@@ -1,13 +1,24 @@
-// Serveur multijoueur Astro.io (positions, tirs, dégâts)
+// Serveur multijoueur Astro.io (positions, tirs, dégâts, chat)
 const { WebSocketServer } = require('ws');
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocketServer({ port: PORT });
-const players = new Map(); // id -> { ws, x, y, a, name, hp }
+const players = new Map(); // id -> { ws, x, y, a, name, hp, last }
 let nextId = 1;
+
+// Filtre de secours côté serveur (le filtre principal est dans le jeu)
+const BAD = ['fuck','shit','putain','merde','connard','salope','pute','nazi','hitler','tiktok','discord','instagram','youtube','snapchat','onlyfans'];
+function clean(t) { return String(t || '').replace(/[\u0000-\u001f\u007f]/g, '').trim(); }
+function chatOk(t) {
+  if (!t || t.length > 120) return false;
+  if (/https?:|www\.|@|\.(com|fr|net|gg|tv)\b/i.test(t)) return false;
+  const n = t.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z]/g, '');
+  return !BAD.some(b => n.includes(b));
+}
+function cleanName(n) { const c = clean(n).slice(0, 10); return c || null; }
 
 wss.on('connection', ws => {
   const id = nextId++;
-  const p = { ws, x: 7000, y: 7000, a: 0, name: 'Pilote' + id, hp: 100 };
+  const p = { ws, x: 7000, y: 7000, a: 0, name: 'Pilote' + id, hp: 100, last: 0 };
   players.set(id, p);
   ws.send(JSON.stringify({ type: 'welcome', id }));
 
@@ -15,7 +26,11 @@ wss.on('connection', ws => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
-    if (msg.type === 'input') {
+    if (msg.type === 'hello') {
+      const n = cleanName(msg.name);
+      if (n) p.name = n;
+    }
+    else if (msg.type === 'input') {
       if (typeof msg.x === 'number') p.x = msg.x;
       if (typeof msg.y === 'number') p.y = msg.y;
       if (typeof msg.a === 'number') p.a = msg.a;
@@ -31,6 +46,18 @@ wss.on('connection', ws => {
       target.hp -= dmg;
       if (target.ws.readyState === 1) target.ws.send(JSON.stringify({ type: 'hurt', dmg }));
       if (target.hp <= 0) target.hp = 100; // réapparition
+    }
+    else if (msg.type === 'chat') {
+      const now = Date.now();
+      if (now - p.last < 1200) return; // anti-spam : 1 message toutes les 1,2 s
+      const text = clean(msg.text).slice(0, 120);
+      if (!chatOk(text)) {
+        if (p.ws.readyState === 1) p.ws.send(JSON.stringify({ type: 'chatBlocked' }));
+        return;
+      }
+      p.last = now;
+      const out = JSON.stringify({ type: 'chat', id, name: p.name, text });
+      players.forEach(q => { if (q.ws.readyState === 1) q.ws.send(out); });
     }
   });
 
