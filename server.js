@@ -87,6 +87,13 @@ const players = new Map(); // id -> { ws, x, y, a, name, hp, last }
 let nextId = 1;
 const WORLD_SEED = (Date.now() % 4294967296) >>> 0; // graine commune des astéroïdes
 const destroyed = new Set(); // astéroïdes déjà détruits
+const CHAT_KEEP = 30 * 60 * 1000; // les messages du chat sont conservés 30 minutes
+const chatLog = []; // { t, msg }
+function purgeChat() {
+  const cut = Date.now() - CHAT_KEEP;
+  while (chatLog.length && chatLog[0].t < cut) chatLog.shift();
+}
+setInterval(purgeChat, 60000);
 const astDmg = new Map(); // dégâts déjà subis par chaque astéroïde (uid -> total)
 
 // Filtre de secours côté serveur (le filtre principal est dans le jeu)
@@ -105,6 +112,8 @@ wss.on('connection', ws => {
   const p = { ws, uid: null, isMod: false, x: 7000, y: 7000, a: 0, name: 'Pilote' + id, hp: 100, maxHp: 100, def: 0, type: 'A', lvl: 1, dead: false, last: 0, sh: 0, maxSh: 0, shT: 0, dmA: 0, bp: {}, pendingBreaks: [], runKills: 0 };
   players.set(id, p);
   ws.send(JSON.stringify({ type: 'welcome', id, seed: WORLD_SEED, destroyed: [...destroyed], dmg: [...astDmg] }));
+  purgeChat();
+  ws.send(JSON.stringify({ type: 'chatHistory', list: chatLog.map(x => x.msg) }));
 
   ws.on('error', () => {}); // évite un crash si une connexion coupe brutalement
 
@@ -237,7 +246,10 @@ wss.on('connection', ws => {
         return;
       }
       p.last = now;
-      const out = JSON.stringify({ type: 'chat', id, name: p.name, text });
+      const msgObj = { type: 'chat', id, name: p.name, text };
+      chatLog.push({ t: now, msg: msgObj });
+      purgeChat();
+      const out = JSON.stringify(msgObj);
       players.forEach(q => { if (q.ws.readyState === 1) q.ws.send(out); });
     }
   });
