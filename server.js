@@ -3,11 +3,60 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
+const crypto = require('crypto');
+const https = require('https');
+
+// ===== Modération =====
+// MOD_UIDS et BANNED_UIDS sont des variables d'environnement sur Render (identifiants Firebase séparés par des virgules)
+const FB_PROJECT = 'astroio';
+const MOD_UIDS = (process.env.MOD_UIDS || '').split(',').map(s => s.trim()).filter(Boolean);
+const bannedUids = new Set((process.env.BANNED_UIDS || '').split(',').map(s => s.trim()).filter(Boolean));
+let certCache = { at: 0, certs: null };
+
+function getCerts() {
+  return new Promise((resolve, reject) => {
+    if (certCache.certs && Date.now() - certCache.at < 3600000) return resolve(certCache.certs);
+    https.get('https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com', res => {
+      let d = '';
+      res.on('data', c => { d += c; });
+      res.on('end', () => {
+        try { certCache = { at: Date.now(), certs: JSON.parse(d) }; resolve(certCache.certs); }
+        catch (e) { reject(e); }
+      });
+    }).on('error', reject);
+  });
+}
+
+// Vérifie le jeton Firebase et renvoie l'identifiant du compte (ou null)
+async function verifyToken(token) {
+  try {
+    const [h, pl, sg] = token.split('.');
+    const header = JSON.parse(Buffer.from(h, 'base64url').toString());
+    const payload = JSON.parse(Buffer.from(pl, 'base64url').toString());
+    const certs = await getCerts();
+    const cert = certs[header.kid];
+    if (!cert || header.alg !== 'RS256') return null;
+    const ok = crypto.createVerify('RSA-SHA256').update(h + '.' + pl).verify(cert, Buffer.from(sg, 'base64url'));
+    if (!ok) return null;
+    const now = Math.floor(Date.now() / 1000);
+    if (payload.aud !== FB_PROJECT || payload.iss !== 'https://securetoken.google.com/' + FB_PROJECT) return null;
+    if (payload.exp < now || payload.iat > now + 300) return null;
+    return payload.sub || null;
+  } catch (e) {
+    return null;
+  }
+}
 
 const PORT = process.env.PORT || 8080;
+const MAX_SIZE = 3 * 1024 * 1024; // taille maximale d'une requête ou d'un message : 3 Mo
 
 // Serveur HTTP : renvoie le jeu à l'adresse principale
 const server = http.createServer((req, res) => {
+  // Requête trop grosse : refusée avant tout traitement
+  if (Number(req.headers['content-length'] || 0) > MAX_SIZE) {
+    res.writeHead(413, { 'Content-Type': 'text/plain; charset=utf-8', 'Connection': 'close' });
+    return res.end('Requête trop volumineuse');
+  }
   if (req.url === '/' || req.url === '/index.html') {
     fs.readFile(path.join(__dirname, 'index.html'), (err, data) => {
       if (err) {
@@ -33,7 +82,7 @@ const server = http.createServer((req, res) => {
 });
 
 // WebSocket attaché au même serveur HTTP
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server, maxPayload: MAX_SIZE }); // message WebSocket trop grand : connexion fermée
 const players = new Map(); // id -> { ws, x, y, a, name, hp, last }
 let nextId = 1;
 const WORLD_SEED = (Date.now() % 4294967296) >>> 0; // graine commune des astéroïdes
@@ -53,7 +102,7 @@ function cleanName(n) { const c = clean(n).slice(0, 10); return c || null; }
 
 wss.on('connection', ws => {
   const id = nextId++;
-  const p = { ws, x: 7000, y: 7000, a: 0, name: 'Pilote' + id, hp: 100, maxHp: 100, def: 0, type: 'A', lvl: 1, dead: false, last: 0, sh: 0, maxSh: 0, shT: 0, dmA: 0, bp: {}, pendingBreaks: [], runKills: 0 };
+  const p = { ws, uid: null, isMod: false, x: 7000, y: 7000, a: 0, name: 'Pilote' + id, hp: 100, maxHp: 100, def: 0, type: 'A', lvl: 1, dead: false, last: 0, sh: 0, maxSh: 0, shT: 0, dmA: 0, bp: {}, pendingBreaks: [], runKills: 0 };
   players.set(id, p);
   ws.send(JSON.stringify({ type: 'welcome', id, seed: WORLD_SEED, destroyed: [...destroyed], dmg: [...astDmg] }));
 
@@ -66,6 +115,30 @@ wss.on('connection', ws => {
     if (msg.type === 'hello') {
       const n = cleanName(msg.name);
       if (n) p.name = n;
+      if (typeof msg.token === 'string') {
+        verifyToken(msg.token).then(uid => {
+          if (!uid) return;
+          if (bannedUids.has(uid)) {
+            if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'banned' }));
+            ws.close();
+            return;
+          }
+          p.uid = uid;
+          p.isMod = MOD_UIDS.includes(uid);
+          if (p.isMod && ws.readyState === 1) ws.send(JSON.stringify({ type: 'mod' }));
+        });
+      }
+    }
+    else if (msg.type === 'modlist' && p.isMod) {
+      const list = [...players].map(([id, q]) => ({ id, name: q.name, mod: q.isMod }));
+      if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'modlist', list }));
+    }
+    else if (msg.type === 'ban' && p.isMod) {
+      const target = players.get(msg.target);
+      if (!target || target === p || target.isMod) return;
+      if (target.uid) bannedUids.add(target.uid); // invité : simple expulsion
+      if (target.ws.readyState === 1) target.ws.send(JSON.stringify({ type: 'banned' }));
+      setTimeout(() => target.ws.close(), 200);
     }
     else if (msg.type === 'input') {
       if (p.dead) return;
